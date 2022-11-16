@@ -23,6 +23,7 @@ class tracy_async_lane {
           return_lane(m_lane_id);
           TracyFiberLeave;
           m_started = false;
+          m_current_zone = std::nullopt;
         }
 
         void activate() {
@@ -37,13 +38,11 @@ class tracy_async_lane {
 
         void begin_phase(const std::string& name, const std::string& description, const tracy::Color::ColorType color) {
           assert(m_started);
-          TracyFiberEnter(tracy_lanes[m_lane_id].name->c_str());
           if(m_current_zone.has_value()) { TracyCZoneEnd(*m_current_zone); }
           TracyCZone(t_ctx, true);
           TracyCZoneName(t_ctx, name.c_str(), name.size());
           TracyCZoneText(t_ctx, description.c_str(), description.size());
           TracyCZoneColor(t_ctx, color);
-          TracyFiberLeave;
           m_current_zone = t_ctx;
         }
 
@@ -79,36 +78,65 @@ class tracy_async_lane {
 class tracy_sink
     : public sycl::profile::sink {
     public:
-        void register_device(sycl::profile::identifier device_id, const sycl::device &device) override {
+        sycl::profile::device_id register_device(std::string name) override {
+          const auto did = sycl::profile::device_id(m_devices.size());
+          m_devices.push_back(device_state{std::move(name)});
+          return did;
+        }
 
+        sycl::profile::backend_queue_id register_device_queue(sycl::profile::device_id device, bool in_order) override {
+          assert(in_order);
+          auto &dev = m_devices.at(size_t(device));
+          dev.num_queues += 1;
+          const auto bqid = sycl::profile::backend_queue_id(m_backend_queues.size());
+          m_backend_queues.push_back(backend_queue_state{fmt::format("{} queue {}", dev.name, dev.num_queues), {}});
+          return bqid;
         }
 
         void set_buffer_name(sycl::profile::identifier buffer_id, std::string name) override {
 
         }
 
-        void task_submit(sycl::profile::task task) override {
-          tracy_async_lane lane;
-          lane.initialize();
-          lane.begin_phase("submit task", fmt::format("T{}", task.id), tracy::Color::Aqua);
-          m_lanes.emplace(task.id, lane);
+        void task_submit_begin(sycl::profile::identifier task_id) override {
+          auto &state = m_threads[std::this_thread::get_id()];
+          TracyCZoneN(ctx, "submit", true);
+          state.zone_ctx = ctx;
         }
 
-        void task_begin_execute(sycl::profile::identifier task_id) override {
-          auto &lane = m_lanes.at(task_id);
-          lane.begin_phase("execute task", fmt::format("T{}", task_id), tracy::Color::Coral);
+        void task_submit_end(sycl::profile::task task) override {
+          auto &state = m_threads.at(std::this_thread::get_id());
+          TracyCZoneEnd(state.zone_ctx);
         }
 
-        void task_end_execute(sycl::profile::identifier task_id) override {
-          auto &lane = m_lanes.at(task_id);
-          lane.destroy();
+        void task_schedule_begin(sycl::profile::identifier task_id) override {
+          auto &state = m_threads[std::this_thread::get_id()];
+          TracyCZoneN(ctx, "schedule", true);
+          state.zone_ctx = ctx;
         }
 
-        void transfer_begin(sycl::profile::transfer transfer) override {
+        void task_schedule_end(sycl::profile::identifier task_id) override {
+          auto &state = m_threads.at(std::this_thread::get_id());
+          TracyCZoneEnd(state.zone_ctx);
+        }
+
+        void task_execute_begin(sycl::profile::backend_queue_id bqid, sycl::profile::identifier task_id) override {
+          auto &state = m_backend_queues.at(size_t(bqid));
+          TracyFiberEnter(state.name.c_str());
+          TracyCZoneN(ctx, "execute", true);
+          state.zone_ctx = ctx;
+        }
+
+        void task_execute_end(sycl::profile::backend_queue_id bqid, sycl::profile::identifier task_id) override {
+          auto &state = m_backend_queues.at(size_t(bqid));
+          TracyCZoneEnd(state.zone_ctx);
+          TracyFiberLeave;
+        }
+
+        void transfer_begin(sycl::profile::backend_queue_id bqid, sycl::profile::transfer transfer) override {
 
         }
 
-        void transfer_end(sycl::profile::identifier transfer_id) override {
+        void transfer_end(sycl::profile::backend_queue_id bqid, sycl::profile::identifier transfer_id) override {
 
         }
 
@@ -125,17 +153,18 @@ class tracy_sink
         }
 
         void wait_begin() override {
-          TracyCZoneN(ctx, "wait", true)
-          m_wait_ctx = ctx;
+          auto &state = m_threads[std::this_thread::get_id()];
+          TracyCZoneN(ctx, "wait", true);
+          state.zone_ctx = ctx;
         }
 
         void wait_begin(std::vector<sycl::profile::identifier> dependencies) override {
-          TracyCZoneN(ctx, "wait", true)
-          m_wait_ctx = ctx;
+          wait_begin();
         }
 
         void wait_end() override {
-          TracyCZoneEnd(m_wait_ctx)
+          auto &state = m_threads.at(std::this_thread::get_id());
+          TracyCZoneEnd(state.zone_ctx);
         }
 
         void idle_begin(sycl::profile::device device) override {
@@ -147,8 +176,21 @@ class tracy_sink
         }
 
     private:
-        std::unordered_map<sycl::profile::identifier, tracy_async_lane> m_lanes;
-        ___tracy_c_zone_context m_wait_ctx;
+        struct device_state {
+            std::string name;
+            size_t num_queues = 0;
+        };
+        struct backend_queue_state {
+            std::string name;
+            TracyCZoneCtx zone_ctx{};
+        };
+        struct thread_state {
+            TracyCZoneCtx zone_ctx{};
+        };
+
+        std::vector<device_state> m_devices;
+        std::vector<backend_queue_state> m_backend_queues;
+        std::unordered_map<std::thread::id, thread_state> m_threads;
 };
 
 
@@ -156,7 +198,7 @@ int main() {
   sycl::profile::the_sink = new tracy_sink;
 
   sycl::queue q;
-  constexpr size_t N = 256;
+  constexpr size_t N = 1024;
 
   sycl::buffer<float, 2> buf_a(sycl::range<2>(N, N));
   sycl::buffer<float, 2> buf_b(sycl::range<2>(N, N));
@@ -177,6 +219,8 @@ int main() {
   }
 
   q.wait();
+
+  sleep(1);
 
   return 0;
 }
